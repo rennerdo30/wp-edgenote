@@ -5,10 +5,12 @@ declare(strict_types=1);
 namespace Edgenote;
 
 use Edgenote\Admin\SettingsPage;
+use Edgenote\Cloudflare\Purger;
+use Edgenote\Cloudflare\SaveHook;
 
 /**
  * Plugin orchestrator. Wires the request detector, the header overrider,
- * and the admin settings page.
+ * the Cloudflare purger, and the admin settings page.
  */
 final class Plugin
 {
@@ -30,8 +32,11 @@ final class Plugin
         $override = new HeaderOverride($request, $settings);
         $override->register();
 
+        $purger = new Purger();
+        (new SaveHook($purger))->register();
+
         if (is_admin()) {
-            (new SettingsPage())->register();
+            (new SettingsPage($purger))->register();
         }
     }
 

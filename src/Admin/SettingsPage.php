@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Edgenote\Admin;
 
 use Edgenote\CacheableRequest;
+use Edgenote\Cloudflare\Purger;
 use Edgenote\HeaderOverride;
 use Edgenote\Plugin;
 
@@ -16,17 +17,34 @@ use Edgenote\Plugin;
  * shows the resolved Cache-Control / Vary values, the active bypass
  * conditions, and a "Test headers" button that fires a HEAD request to
  * the home URL to surface the actual response the public sees.
+ *
+ * Also exposes the Cloudflare cache-purge settings (API token, zone ID,
+ * purge mode) plus a "Test connection" button that round-trips
+ * GET /zones/<id> and a "Purge all" emergency button.
  */
 final class SettingsPage
 {
-    private const PAGE_SLUG  = 'edgenote';
-    private const NONCE      = 'edgenote_test_headers';
+    private const PAGE_SLUG          = 'edgenote';
+    private const NONCE              = 'edgenote_test_headers';
+    private const NONCE_CF_TEST      = 'edgenote_cf_test';
+    private const NONCE_CF_PURGE_ALL = 'edgenote_cf_purge_all';
+    /** Placeholder shown in the token field when a value is already stored. */
+    private const TOKEN_MASK         = '__edgenote_masked__';
+
+    private Purger $purger;
+
+    public function __construct(?Purger $purger = null)
+    {
+        $this->purger = $purger ?? new Purger();
+    }
 
     public function register(): void
     {
         add_action('admin_init', [$this, 'register_settings']);
         add_action('admin_menu', [$this, 'register_menu']);
         add_action('wp_ajax_edgenote_test_headers', [$this, 'ajax_test_headers']);
+        add_action('wp_ajax_edgenote_cf_test', [$this, 'ajax_cf_test']);
+        add_action('wp_ajax_edgenote_cf_purge_all', [$this, 'ajax_cf_purge_all']);
     }
 
     public function register_settings(): void
@@ -36,6 +54,51 @@ final class SettingsPage
             'sanitize_callback' => [$this, 'sanitize'],
             'default'           => Plugin::DEFAULTS,
         ]);
+
+        // Cloudflare settings — registered separately so they can be saved
+        // by the same options.php POST but kept out of the REST-exposed
+        // edgenote_settings array. The token option is marked
+        // show_in_rest=false to prevent accidental leakage.
+        register_setting('edgenote_group', Purger::OPTION_TOKEN, [
+            'type'              => 'string',
+            'sanitize_callback' => [$this, 'sanitize_cf_token'],
+            'show_in_rest'      => false,
+            'default'           => '',
+        ]);
+        register_setting('edgenote_group', Purger::OPTION_ZONE, [
+            'type'              => 'string',
+            'sanitize_callback' => static function ($v): string {
+                return preg_replace('/[^a-zA-Z0-9]/', '', (string) $v) ?? '';
+            },
+            'show_in_rest'      => false,
+            'default'           => '',
+        ]);
+        register_setting('edgenote_group', Purger::OPTION_MODE, [
+            'type'              => 'string',
+            'sanitize_callback' => static function ($v): string {
+                $v = (string) $v;
+                return in_array($v, [Purger::MODE_URLS, Purger::MODE_EVERYTHING, Purger::MODE_DISABLED], true)
+                    ? $v
+                    : Purger::MODE_URLS;
+            },
+            'show_in_rest'      => false,
+            'default'           => Purger::MODE_URLS,
+        ]);
+    }
+
+    /**
+     * Token sanitizer. When the form submits the masked placeholder we
+     * leave the stored value untouched — that's how we keep the secret
+     * from re-emitting to the browser on every page load.
+     */
+    public function sanitize_cf_token($value): string
+    {
+        $value = is_string($value) ? trim($value) : '';
+        if ($value === '' || $value === self::TOKEN_MASK) {
+            return (string) get_option(Purger::OPTION_TOKEN, '');
+        }
+        // Cloudflare API tokens are URL-safe base64-ish; strip whitespace only.
+        return $value;
     }
 
     public function register_menu(): void
@@ -68,9 +131,16 @@ final class SettingsPage
             return;
         }
         $settings = Plugin::settings();
-        $nonce    = wp_create_nonce(self::NONCE);
-        $request  = new CacheableRequest($settings);
-        $override = new HeaderOverride($request, $settings);
+        $nonce       = wp_create_nonce(self::NONCE);
+        $cf_nonce    = wp_create_nonce(self::NONCE_CF_TEST);
+        $purge_nonce = wp_create_nonce(self::NONCE_CF_PURGE_ALL);
+        $request     = new CacheableRequest($settings);
+        $override    = new HeaderOverride($request, $settings);
+
+        $cf_mode       = $this->purger->mode();
+        $cf_zone       = $this->purger->zoneId();
+        $cf_has_token  = $this->purger->token() !== '';
+        $cf_token_attr = $cf_has_token ? self::TOKEN_MASK : '';
 
         $bypass_cookies = array_values(array_filter(array_map(
             'trim',
@@ -194,8 +264,48 @@ final class SettingsPage
                         </td>
                     </tr>
                 </table>
+
+                <h2 class="title"><?php esc_html_e('Cloudflare cache purge', 'edgenote'); ?></h2>
+                <p class="description">
+                    <?php esc_html_e('When a post is saved, deleted, or a nav menu changes, Edgenote can call the Cloudflare Purge API so the edge serves the new content immediately. Pairs well with aggressive Cache Rules (4h+ Edge TTL).', 'edgenote'); ?>
+                </p>
+                <table class="form-table" role="presentation">
+                    <tr>
+                        <th scope="row"><label for="edgenote-cf-token"><?php esc_html_e('Cloudflare API token', 'edgenote'); ?></label></th>
+                        <td>
+                            <input id="edgenote-cf-token" name="<?php echo esc_attr(Purger::OPTION_TOKEN); ?>" type="password" autocomplete="new-password" value="<?php echo esc_attr($cf_token_attr); ?>" class="regular-text" placeholder="<?php echo $cf_has_token ? esc_attr__('(stored — leave masked to keep)', 'edgenote') : ''; ?>" />
+                            <p class="description"><?php echo wp_kses_post(__('A scoped API token with the <code>Zone.Cache Purge</code> permission for this zone. The stored value is never returned to the browser.', 'edgenote')); ?></p>
+                        </td>
+                    </tr>
+                    <tr>
+                        <th scope="row"><label for="edgenote-cf-zone"><?php esc_html_e('Cloudflare zone ID', 'edgenote'); ?></label></th>
+                        <td>
+                            <input id="edgenote-cf-zone" name="<?php echo esc_attr(Purger::OPTION_ZONE); ?>" type="text" value="<?php echo esc_attr($cf_zone); ?>" class="regular-text" autocomplete="off" />
+                            <p class="description"><?php esc_html_e('Found in the Cloudflare dashboard → Overview → API section.', 'edgenote'); ?></p>
+                        </td>
+                    </tr>
+                    <tr>
+                        <th scope="row"><label for="edgenote-cf-mode"><?php esc_html_e('Purge mode', 'edgenote'); ?></label></th>
+                        <td>
+                            <select id="edgenote-cf-mode" name="<?php echo esc_attr(Purger::OPTION_MODE); ?>">
+                                <option value="<?php echo esc_attr(Purger::MODE_URLS); ?>" <?php selected($cf_mode, Purger::MODE_URLS); ?>><?php esc_html_e('URLs — purge the post permalink + home + archives (surgical, recommended)', 'edgenote'); ?></option>
+                                <option value="<?php echo esc_attr(Purger::MODE_EVERYTHING); ?>" <?php selected($cf_mode, Purger::MODE_EVERYTHING); ?>><?php esc_html_e('Everything — purge the whole zone on every save (heavy)', 'edgenote'); ?></option>
+                                <option value="<?php echo esc_attr(Purger::MODE_DISABLED); ?>" <?php selected($cf_mode, Purger::MODE_DISABLED); ?>><?php esc_html_e('Disabled — no auto-purge (manual only)', 'edgenote'); ?></option>
+                            </select>
+                            <p class="description"><?php esc_html_e('Auto-purges are skipped during WP-CLI runs and for non-public post types.', 'edgenote'); ?></p>
+                        </td>
+                    </tr>
+                </table>
+
                 <?php submit_button(); ?>
             </form>
+
+            <p style="margin-top:6px;">
+                <button type="button" class="button button-secondary" id="edgenote-cf-test-button" data-nonce="<?php echo esc_attr($cf_nonce); ?>"><?php esc_html_e('Test connection', 'edgenote'); ?></button>
+                <button type="button" class="button" id="edgenote-cf-purge-all-button" data-nonce="<?php echo esc_attr($purge_nonce); ?>"><?php esc_html_e('Purge all (emergency)', 'edgenote'); ?></button>
+                <span class="description"><?php esc_html_e('Save changes first if you just edited the token or zone ID.', 'edgenote'); ?></span>
+            </p>
+            <pre id="edgenote-cf-output" style="background:#0b0b0b;color:#dfe3e6;padding:14px;border-radius:6px;min-height:40px;overflow:auto;max-width:780px;"><?php esc_html_e('(no result yet)', 'edgenote'); ?></pre>
 
             <hr>
             <h2><?php esc_html_e('Cloudflare setup', 'edgenote'); ?></h2>
@@ -226,6 +336,34 @@ final class SettingsPage
                         })
                         .catch(function (e) { out.textContent = String(e); });
                 });
+            })();
+
+            (function () {
+                var out = document.getElementById('edgenote-cf-output');
+                function call(action, btn) {
+                    if (!btn) return;
+                    btn.addEventListener('click', function () {
+                        if (action === 'edgenote_cf_purge_all' && !window.confirm(<?php echo wp_json_encode(__('Purge the entire Cloudflare zone now?', 'edgenote')); ?>)) {
+                            return;
+                        }
+                        out.textContent = '...';
+                        var fd = new FormData();
+                        fd.append('action', action);
+                        fd.append('_wpnonce', btn.dataset.nonce);
+                        fetch(ajaxurl, { method: 'POST', credentials: 'same-origin', body: fd })
+                            .then(function (r) { return r.json(); })
+                            .then(function (j) {
+                                if (j && j.success) {
+                                    out.textContent = (j.data && j.data.message) ? j.data.message : 'OK';
+                                } else {
+                                    out.textContent = (j && j.data && j.data.message) ? j.data.message : 'Error';
+                                }
+                            })
+                            .catch(function (e) { out.textContent = String(e); });
+                    });
+                }
+                call('edgenote_cf_test',      document.getElementById('edgenote-cf-test-button'));
+                call('edgenote_cf_purge_all', document.getElementById('edgenote-cf-purge-all-button'));
             })();
             </script>
         </div>
@@ -258,5 +396,55 @@ final class SettingsPage
             $lines[] = $k . ': ' . (is_array($v) ? implode(', ', $v) : (string) $v);
         }
         wp_send_json_success(['headers' => implode("\n", $lines)]);
+    }
+
+    /**
+     * AJAX: round-trip GET /zones/<id> to verify the stored token + zone.
+     */
+    public function ajax_cf_test(): void
+    {
+        if (!current_user_can('manage_options')) {
+            wp_send_json_error(['message' => __('Forbidden', 'edgenote')], 403);
+        }
+        check_ajax_referer(self::NONCE_CF_TEST);
+
+        if (!$this->purger->isConfigured()) {
+            wp_send_json_error(['message' => __('Save a token and zone ID first.', 'edgenote')]);
+        }
+
+        $result = $this->purger->verifyToken();
+        if (is_wp_error($result)) {
+            wp_send_json_error(['message' => $result->get_error_message()]);
+        }
+        wp_send_json_success([
+            'message' => sprintf(
+                /* translators: %s: zone id */
+                __('Connection OK — token authorized for zone %s.', 'edgenote'),
+                $this->purger->zoneId()
+            ),
+        ]);
+    }
+
+    /**
+     * AJAX: emergency "purge everything" on the configured zone.
+     */
+    public function ajax_cf_purge_all(): void
+    {
+        if (!current_user_can('manage_options')) {
+            wp_send_json_error(['message' => __('Forbidden', 'edgenote')], 403);
+        }
+        check_ajax_referer(self::NONCE_CF_PURGE_ALL);
+
+        if (!$this->purger->isConfigured()) {
+            wp_send_json_error(['message' => __('Save a token and zone ID first.', 'edgenote')]);
+        }
+
+        $result = $this->purger->purgeEverything();
+        if (is_wp_error($result)) {
+            wp_send_json_error(['message' => $result->get_error_message()]);
+        }
+        wp_send_json_success([
+            'message' => __('Purged the entire zone.', 'edgenote'),
+        ]);
     }
 }
