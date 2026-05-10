@@ -1,7 +1,7 @@
 <?php
 /**
  * Plugin Name: Edgenote
- * Plugin URI: https://github.com/rennerdo30/edgenote
+ * Plugin URI: https://github.com/rennerdo30/wp-edgenote
  * Description: Cache-Control header helper for Cloudflare and other edge CDNs. Surgically overrides WordPress 6.8+'s aggressive nocache_headers on anonymous public requests. MIT.
  * Version: 0.1.0
  * Author: Renner

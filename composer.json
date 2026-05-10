@@ -3,7 +3,7 @@
   "description": "Cache-Control header helper for Cloudflare and other edge CDNs. Surgically overrides WordPress 6.8+'s aggressive nocache_headers on anonymous public requests.",
   "type": "wordpress-plugin",
   "license": "MIT",
-  "homepage": "https://github.com/rennerdo30/edgenote",
+  "homepage": "https://github.com/rennerdo30/wp-edgenote",
   "authors": [
     { "name": "Renner", "homepage": "https://renner.dev" }
   ],
