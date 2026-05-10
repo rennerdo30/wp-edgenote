@@ -4,15 +4,18 @@ declare(strict_types=1);
 
 namespace Edgenote\Admin;
 
+use Edgenote\CacheableRequest;
+use Edgenote\HeaderOverride;
 use Edgenote\Plugin;
 
 /**
- * Settings → Edgenote.
+ * Edgenote → top-level admin menu.
  *
  * Lets the operator tune s-maxage, stale-while-revalidate, the cookie
- * bypass list, and the path bypass list. Includes a "Test headers"
- * button that fires a HEAD request to the home URL and shows the
- * actual Cache-Control + Vary the public sees.
+ * bypass list, and the path bypass list. Adds an "Overview" panel that
+ * shows the resolved Cache-Control / Vary values, the active bypass
+ * conditions, and a "Test headers" button that fires a HEAD request to
+ * the home URL to surface the actual response the public sees.
  */
 final class SettingsPage
 {
@@ -37,12 +40,14 @@ final class SettingsPage
 
     public function register_menu(): void
     {
-        add_options_page(
+        add_menu_page(
             __('Edgenote', 'edgenote'),
             __('Edgenote', 'edgenote'),
             'manage_options',
             self::PAGE_SLUG,
-            [$this, 'render']
+            [$this, 'render'],
+            'dashicons-cloud',
+            81
         );
     }
 
@@ -64,6 +69,30 @@ final class SettingsPage
         }
         $settings = Plugin::settings();
         $nonce    = wp_create_nonce(self::NONCE);
+        $request  = new CacheableRequest($settings);
+        $override = new HeaderOverride($request, $settings);
+
+        $bypass_cookies = array_values(array_filter(array_map(
+            'trim',
+            preg_split('/\r\n|\r|\n/', (string) $settings['bypass_cookies']) ?: []
+        )));
+        $bypass_paths = array_values(array_filter(array_map(
+            'trim',
+            preg_split('/\r\n|\r|\n/', (string) $settings['bypass_paths']) ?: []
+        )));
+
+        // Static list of every condition that suppresses Edgenote.
+        $always_bypassed = [
+            __('wp-admin requests',           'edgenote'),
+            __('REST API requests',           'edgenote'),
+            __('AJAX requests',               'edgenote'),
+            __('Logged-in users',             'edgenote'),
+            __('Search results',              'edgenote'),
+            __('RSS / Atom feeds',            'edgenote'),
+            __('404 responses',               'edgenote'),
+            __('Preview / draft requests',    'edgenote'),
+            __('Non-GET / non-HEAD methods',  'edgenote'),
+        ];
         ?>
         <div class="wrap">
             <h1><?php esc_html_e('Edgenote', 'edgenote'); ?></h1>
@@ -71,6 +100,68 @@ final class SettingsPage
                 <?php esc_html_e('Surgically overrides WordPress 6.8+ Cache-Control headers on anonymous public requests so Cloudflare (and other edge CDNs) can actually cache your site.', 'edgenote'); ?>
             </p>
 
+            <h2 class="title"><?php esc_html_e('Overview', 'edgenote'); ?></h2>
+            <table class="widefat striped" style="max-width:780px;">
+                <tbody>
+                    <tr>
+                        <th scope="row" style="width:220px;"><?php esc_html_e('Cache-Control (resolved)', 'edgenote'); ?></th>
+                        <td><code><?php echo esc_html($override->cache_control_value()); ?></code></td>
+                    </tr>
+                    <tr>
+                        <th scope="row"><?php esc_html_e('Vary (resolved)', 'edgenote'); ?></th>
+                        <td><code><?php echo esc_html($override->vary_value()); ?></code></td>
+                    </tr>
+                    <tr>
+                        <th scope="row"><?php esc_html_e('Edge TTL (s-maxage)', 'edgenote'); ?></th>
+                        <td><?php echo esc_html((string) $settings['s_maxage']); ?>s</td>
+                    </tr>
+                    <tr>
+                        <th scope="row"><?php esc_html_e('Stale-while-revalidate', 'edgenote'); ?></th>
+                        <td><?php echo esc_html((string) $settings['stale_while_revalidate']); ?>s</td>
+                    </tr>
+                    <tr>
+                        <th scope="row"><?php esc_html_e('Always-bypass conditions', 'edgenote'); ?></th>
+                        <td>
+                            <?php foreach ($always_bypassed as $label): ?>
+                                <span class="edgenote-chip" style="display:inline-block;margin:2px 4px 2px 0;padding:2px 8px;background:#f0f0f1;border-radius:10px;font-size:12px;"><?php echo esc_html($label); ?></span>
+                            <?php endforeach; ?>
+                        </td>
+                    </tr>
+                    <tr>
+                        <th scope="row"><?php esc_html_e('Bypass cookies', 'edgenote'); ?></th>
+                        <td>
+                            <?php if ($bypass_cookies === []): ?>
+                                <em><?php esc_html_e('(none)', 'edgenote'); ?></em>
+                            <?php else: ?>
+                                <?php foreach ($bypass_cookies as $c): ?>
+                                    <code style="margin-right:6px;"><?php echo esc_html($c); ?></code>
+                                <?php endforeach; ?>
+                            <?php endif; ?>
+                        </td>
+                    </tr>
+                    <tr>
+                        <th scope="row"><?php esc_html_e('Bypass paths', 'edgenote'); ?></th>
+                        <td>
+                            <?php if ($bypass_paths === []): ?>
+                                <em><?php esc_html_e('(none)', 'edgenote'); ?></em>
+                            <?php else: ?>
+                                <?php foreach ($bypass_paths as $p): ?>
+                                    <code style="margin-right:6px;"><?php echo esc_html($p); ?></code>
+                                <?php endforeach; ?>
+                            <?php endif; ?>
+                        </td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <p style="margin-top:12px;">
+                <button type="button" class="button button-secondary" id="edgenote-test-button" data-nonce="<?php echo esc_attr($nonce); ?>"><?php esc_html_e('Test live headers', 'edgenote'); ?></button>
+                <span class="description"><?php esc_html_e('Fire a HEAD request to the home URL and show the actual response.', 'edgenote'); ?></span>
+            </p>
+            <pre id="edgenote-test-output" style="background:#0b0b0b;color:#dfe3e6;padding:14px;border-radius:6px;min-height:60px;overflow:auto;max-width:780px;"><?php esc_html_e('(no result yet)', 'edgenote'); ?></pre>
+
+            <hr>
+            <h2 class="title"><?php esc_html_e('Settings', 'edgenote'); ?></h2>
             <form action="options.php" method="post">
                 <?php settings_fields('edgenote_group'); ?>
                 <table class="form-table" role="presentation">
@@ -107,13 +198,6 @@ final class SettingsPage
             </form>
 
             <hr>
-            <h2><?php esc_html_e('Test live headers', 'edgenote'); ?></h2>
-            <p><?php esc_html_e('Fire a HEAD request to the home URL and show the actual Cache-Control / Vary headers the public receives.', 'edgenote'); ?></p>
-            <p>
-                <button type="button" class="button button-secondary" id="edgenote-test-button" data-nonce="<?php echo esc_attr($nonce); ?>"><?php esc_html_e('Test headers', 'edgenote'); ?></button>
-            </p>
-            <pre id="edgenote-test-output" style="background:#0b0b0b;color:#dfe3e6;padding:14px;border-radius:6px;min-height:60px;overflow:auto;"><?php esc_html_e('(no result yet)', 'edgenote'); ?></pre>
-
             <h2><?php esc_html_e('Cloudflare setup', 'edgenote'); ?></h2>
             <ol>
                 <li><?php echo wp_kses_post(__('In Cloudflare → Caching → Configuration, enable <strong>Respect Existing Headers</strong>.', 'edgenote')); ?></li>
